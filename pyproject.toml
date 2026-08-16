@@ -1,0 +1,47 @@
+[project]
+name = "langchain-tutorials"
+version = "0.1.0"
+description = "LangChain Tutorials"
+readme = "README.md"
+requires-python = ">=3.13"
+authors = [{ name = "e-hossam96", email = "ehh.hossam@gmail.com" }]
+dependencies = [
+  "langchain>=1.2.9",
+  "langchain-community>=0.4.1",
+  "langchain-mcp-adapters>=0.2.1",
+  "langchain-openai>=1.1.7",
+  "langfuse>=4.14.4",
+  "mcp>=1.26.0",
+  "openai>=2.17.0",
+  "pydantic>=2.12.5",
+  "pydantic-settings>=2.12.0",
+  "python-dotenv>=1.2.1",
+  "rich>=14.2.0",
+  "sqlalchemy>=2.0.46",
+  "tavily-python>=0.7.17",
+  "tqdm>=4.67.1",
+]
+
+[dependency-groups]
+dev = ["ruff>=0.9.0"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+select = [
+  "E",  # pycodestyle errors
+  "W",  # pycodestyle warnings
+  "F",  # pyflakes
+  "I",  # isort
+  "UP",  # pyupgrade
+  "B",  # flake8-bugbear
+  "SIM",  # flake8-simplify
+  "C4",  # flake8-comprehensions
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
