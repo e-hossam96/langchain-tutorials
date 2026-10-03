@@ -2,16 +2,12 @@ import typing as t
 import uuid
 from dataclasses import dataclass
 
-from langchain.agents import AgentState, create_agent
-from langchain.agents.middleware import ModelRequest, ModelResponse, wrap_model_call
-from langchain.messages import ToolMessage
-from langchain.tools import BaseTool, ToolRuntime, tool
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import BaseTool, InjectedToolArg, tool
 from langchain_openai import ChatOpenAI
 from langfuse import Langfuse
 from langfuse.langchain import CallbackHandler
-from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.types import Command
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from rich.console import Console
@@ -65,12 +61,21 @@ class UserContext:
     user_name: str
 
 
-class AppAgentState(AgentState):
+class AppAgentState(t.TypedDict):
     is_authenticated_user: bool
 
 
+@dataclass
+class Runtime[ContextT]:
+    """Per-tool-call handle for injected context/state (replaces langgraph's ToolRuntime)."""
+
+    tool_call_id: str
+    context: ContextT
+    state: AppAgentState
+
+
 @tool
-def get_user_name_from_context(runtime: ToolRuntime[UserContext, AppAgentState]) -> str:
+def get_user_name_from_context(runtime: t.Annotated[Runtime[UserContext], InjectedToolArg]) -> str:
     """Retrieve the current user's name from the run context."""
     return runtime.context.user_name
 
@@ -85,21 +90,15 @@ def check_user_exists_in_db(user_name: str) -> bool:
 
 @tool
 def update_user_authentication_state(
-    is_authenticated_user: bool, runtime: ToolRuntime[UserContext, AppAgentState]
-) -> Command[str]:
+    is_authenticated_user: bool, runtime: t.Annotated[Runtime[UserContext], InjectedToolArg]
+) -> str:
     """Update the agent state with the user's authentication status."""
-    return Command[str](
-        update={
-            "is_authenticated_user": is_authenticated_user,
-            "messages": [
-                ToolMessage(content="Successfuly updated user existing status.", tool_call_id=runtime.tool_call_id)
-            ],
-        }
-    )
+    runtime.state["is_authenticated_user"] = is_authenticated_user
+    return "Successfuly updated user existing status."
 
 
 @tool
-def get_user_authentication_state(runtime: ToolRuntime[UserContext, AppAgentState]) -> dict[str, bool]:
+def get_user_authentication_state(runtime: t.Annotated[Runtime[UserContext], InjectedToolArg]) -> dict[str, bool]:
     """Return the current authentication-related state of the agent."""
     return {"is_authenticated_user": runtime.state.get("is_authenticated_user", False)}
 
@@ -160,9 +159,8 @@ def insert_books_into_db(books: list[Book]) -> bool:
     return True
 
 
-@wrap_model_call
-def change_available_tools(request: ModelRequest, handler: t.Callable[[ModelRequest], ModelResponse]) -> ModelResponse:
-    is_authenticated_user: bool = request.state.get("is_authenticated_user", False)
+def select_tools(state: AppAgentState) -> list[BaseTool]:
+    is_authenticated_user: bool = state.get("is_authenticated_user", False)
     available_tools: list[BaseTool] = [
         get_user_name_from_context,
         check_user_exists_in_db,
@@ -173,8 +171,39 @@ def change_available_tools(request: ModelRequest, handler: t.Callable[[ModelRequ
     ]
     if is_authenticated_user:
         available_tools.append(insert_books_into_db)
-    request = request.override(tools=available_tools)
-    return handler(request)
+    return available_tools
+
+
+def _accepts_runtime(tool_obj: BaseTool) -> bool:
+    return "runtime" in tool_obj.args_schema.model_fields
+
+
+def run_agent_turn(
+    *,
+    model: ChatOpenAI,
+    messages: list[BaseMessage],
+    state: AppAgentState,
+    context: UserContext,
+    config: RunnableConfig,
+) -> AIMessage:
+    """Run one user turn to completion: call the model, execute any tool calls it makes,
+    and repeat until the model responds without further tool calls."""
+    while True:
+        active_tools = select_tools(state)
+        tool_map = {tool_obj.name: tool_obj for tool_obj in active_tools}
+        ai_message = model.bind_tools(active_tools).invoke(messages, config=config)
+        messages.append(ai_message)
+
+        if not ai_message.tool_calls:
+            return ai_message
+
+        for tool_call in ai_message.tool_calls:
+            tool_obj = tool_map[tool_call["name"]]
+            call_args = dict(tool_call["args"])
+            if _accepts_runtime(tool_obj):
+                call_args["runtime"] = Runtime(tool_call_id=tool_call["id"], context=context, state=state)
+            tool_message = tool_obj.invoke({**tool_call, "args": call_args}, config=config)
+            messages.append(tool_message)
 
 
 SYSTEM_PROMPT = """You are a helpful AI assistant that manages a book database.
@@ -211,24 +240,6 @@ new books to the database.
 Non-authenticated users get access to search online for books and get the book list from the database. \
 They are not allowed to add books to the database."""
 
-agent = create_agent(
-    model=llm,
-    tools=[
-        get_user_name_from_context,
-        check_user_exists_in_db,
-        update_user_authentication_state,
-        get_user_authentication_state,
-        web_search,
-        get_available_books_from_db,
-        insert_books_into_db,
-    ],
-    system_prompt=SYSTEM_PROMPT,
-    checkpointer=InMemorySaver(),
-    middleware=[change_available_tools],
-    context_schema=UserContext,
-    state_schema=AppAgentState,
-)
-
 
 def main() -> None:
     langfuse_handler = CallbackHandler()
@@ -239,14 +250,15 @@ def main() -> None:
     thread_id = uuid.uuid4().hex
 
     config: RunnableConfig = {
-        "configurable": {
-            "thread_id": thread_id,
-        },
         "callbacks": [langfuse_handler],
         "metadata": {
             "langfuse_session_id": thread_id,
         },
     }
+
+    context = UserContext(user_name="hossam")
+    state: AppAgentState = {"is_authenticated_user": False}
+    messages: list[BaseMessage] = [SystemMessage(SYSTEM_PROMPT)]
 
     while True:
         user_input = input("User: ")
@@ -254,26 +266,20 @@ def main() -> None:
             rich_console.print("Exiting...", style="bold red")
             break
 
-        response = agent.invoke(
-            input={
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": user_input},
-                        ],
-                    },
-                ]
-            },
+        messages.append(HumanMessage(content=[{"type": "input_text", "text": user_input}]))
+
+        ai_message = run_agent_turn(
+            model=llm,
+            messages=messages,
+            state=state,
+            context=context,
             config=config,
-            stream_mode="values",
-            context=UserContext(user_name="hossam"),
         )
 
-        response_content = response["messages"][-1].content[-1]["text"]
+        response_content = ai_message.content[-1]["text"]
         rich_console.print("AI Agent:", style="bold green", end=" ")
         rich_console.print(Markdown(response_content), style="green")
-        usage_metadata = response["messages"][-1].usage_metadata
+        usage_metadata = ai_message.usage_metadata
         rich_console.print(Markdown(f"{usage_metadata}"), style="blue")
         rich_console.print()
 
